@@ -230,7 +230,7 @@ if (GGML_CPU)
     llama_test(test-llama-archs  NAME test-fp8-requantize  LABEL "main behavior backend"  ARGS -a llama -b CPU -s 1)
 endif()
 
-llama_test(test-llama-archs NAME test-fp8-kv ARGS -a ^llama$ -b CPU -s 0)
+llama_test(test-llama-archs NAME test-fp8-kv ARGS -a ^llama$)
 
 set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
 file(MAKE_DIRECTORY "${MODEL_DIR}")
