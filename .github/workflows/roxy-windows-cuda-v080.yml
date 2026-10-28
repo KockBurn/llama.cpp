@@ -1,0 +1,222 @@
+name: Roxy | llama.cpp v0.8.0 | Windows CUDA 12.4
+
+# On-demand only. Never touches the user's PC, production folders, or other repositories.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Build profile (test embeds llama.cpp UI; production excludes it)
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+          - production
+
+permissions:
+  contents: read
+
+concurrency:
+  group: roxy-llama-v080-${{ github.ref }}-${{ inputs.profile }}
+  cancel-in-progress: false
+
+jobs:
+  windows-cuda:
+    name: v0.8.0 / CUDA 12.4 / sm_86 / ${{ inputs.profile }}
+    runs-on: windows-2022
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      UPSTREAM_TAG: v0.8.0
+      CUDA_VERSION: "12.4"
+      CUDA_SM: "86"
+      ROXY_PROFILE: ${{ inputs.profile }}
+
+    steps:
+      # Deliberately compile the exact official release, independent of the
+      # fork's moving master branch. The workflow itself lives in the fork.
+      - name: Checkout official llama.cpp v0.8.0
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: v0.8.0
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify pinned source
+        run: |
+          $actual = (git -C source describe --tags --exact-match).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:UPSTREAM_TAG) {
+            throw "Expected official tag $env:UPSTREAM_TAG but found '$actual'"
+          }
+          git -C source rev-parse HEAD
+
+      - name: Install CUDA 12.4 (on GitHub runner only)
+        uses: ./source/.github/actions/windows-setup-cuda
+        with:
+          cuda_version: "12.4"
+          cuda_arch: x64
+
+      - name: Install Ninja
+        run: |
+          choco install ninja -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Ninja installation failed" }
+
+      - name: Set up Node.js for test UI
+        if: inputs.profile == 'test'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Build llama.cpp embedded browser UI (test profile only)
+        if: inputs.profile == 'test'
+        run: |
+          Push-Location source/tools/ui
+          try {
+            npm ci
+            if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+            npm run build
+            if ($LASTEXITCODE -ne 0) { throw "llama.cpp UI build failed" }
+          } finally {
+            Pop-Location
+          }
+          if (-not (Test-Path -LiteralPath source/tools/ui/dist/index.html)) {
+            throw "Test profile requested UI, but dist/index.html was not generated"
+          }
+
+      - name: Build server and CLI with CUDA SM 8.6
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          if errorlevel 1 exit /b 1
+          cmake -S source -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=ON ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES=86 ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_EXAMPLES=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_UI=OFF ^
+            -DLLAMA_USE_PREBUILT_UI=OFF
+          if errorlevel 1 exit /b 1
+          cmake --build build --config Release --parallel 4 --target llama-server llama-cli
+          if errorlevel 1 exit /b 1
+
+      - name: Assemble matched portable CUDA package
+        id: package
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = Join-Path $PWD "package"
+          $out = Join-Path $PWD "out"
+          New-Item -ItemType Directory -Force -Path $stage, $out | Out-Null
+          $bin = Join-Path $PWD "build/bin/Release"
+          if (-not (Test-Path -LiteralPath $bin)) {
+            throw "Missing expected build output: $bin"
+          }
+          Copy-Item -Path (Join-Path $bin "*") -Destination $stage -Recurse -Force
+
+          # Only portable runtime dependencies. No toolkit installation on user's PC.
+          # Match the CUDA version installed on THIS runner; never mix upstream zips.
+          if (-not $env:CUDA_PATH -or -not (Test-Path $env:CUDA_PATH)) {
+            throw "CUDA_PATH was not configured by the upstream CUDA setup action"
+          }
+          $cudaDirs = @(
+            (Join-Path $env:CUDA_PATH "bin"),
+            (Join-Path $env:CUDA_PATH "bin/x64"),
+            (Join-Path $env:CUDA_PATH "lib")
+          )
+          $mandatory = @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")
+          $optional = @("nvrtc64_*.dll", "nvrtc-builtins64_*.dll", "nvJitLink*.dll")
+          foreach ($pattern in ($mandatory + $optional)) {
+            $found = @()
+            foreach ($dir in $cudaDirs) {
+              if (Test-Path -LiteralPath $dir) {
+                $found += @(Get-ChildItem -Path (Join-Path $dir $pattern) -File -ErrorAction SilentlyContinue)
+              }
+            }
+            if ($pattern -in $mandatory -and $found.Count -eq 0) {
+              throw "CUDA dependency missing for $pattern in $($cudaDirs -join ', ')"
+            }
+            foreach ($item in ($found | Sort-Object Name -Unique)) {
+              Copy-Item -LiteralPath $item.FullName -Destination $stage -Force
+            }
+          }
+
+          foreach ($file in @(
+            "llama-server.exe", "llama-cli.exe", "llama.dll", "ggml.dll",
+            "ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll"
+          )) {
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $file))) {
+              throw "Expected executable or backend DLL is missing: $file"
+            }
+          }
+          Copy-Item -LiteralPath source/LICENSE -Destination $stage -Force
+
+          # Verify process startup without a GPU (hosted runners are GPU-less).
+          $server = Join-Path $stage "llama-server.exe"
+          & $server --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "llama-server.exe --version failed with exit code $LASTEXITCODE"
+          }
+
+          $sourceSha = (git -C source rev-parse HEAD).Trim()
+          $meta = [ordered]@{
+            upstream_repository = "ggml-org/llama.cpp"
+            upstream_tag = "v0.8.0"
+            upstream_commit = $sourceSha
+            build_profile = $env:ROXY_PROFILE
+            platform = "windows-x64"
+            cuda_toolkit = $env:CUDA_VERSION
+            cuda_architectures = $env:CUDA_SM
+            includes_llama_ui = ($env:ROXY_PROFILE -eq "test")
+            generated_utc = (Get-Date).ToUniversalTime().ToString("o")
+            github_run_id = $env:GITHUB_RUN_ID
+          }
+          $meta | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $stage "BUILD-MANIFEST.json") -Encoding utf8
+          $readme = @(
+            "Roxy llama.cpp portable build - v0.8.0 / CUDA 12.4 / sm_86"
+            "Profile: $env:ROXY_PROFILE"
+            "Official upstream source commit: $sourceSha"
+            ""
+            "This is a portable archive, not an installer."
+            "Extract into a NEW directory. Keep all DLLs with llama-server.exe."
+            "Test with: .\llama-server.exe --version"
+            "To disable the embedded UI at runtime: --no-ui"
+            "Requires a compatible NVIDIA driver (RTX 3080 Ti / RTX 3090, compute 8.6)."
+            "Actual GPU inference/vision must be tested on the user's hardware."
+            "No production deployment or auto-update is performed by GitHub Actions."
+          )
+          $readme | Set-Content -Path (Join-Path $stage "README-ROXY.txt") -Encoding utf8
+
+          $hashes = @(Get-ChildItem -LiteralPath $stage -File |
+            Sort-Object Name |
+            Where-Object { $_.Name -ne "SHA256SUMS.txt" } |
+            ForEach-Object { $h = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256; "$($h.Hash)  $($_.Name)" })
+          $hashes | Set-Content -Path (Join-Path $stage "SHA256SUMS.txt") -Encoding ascii
+
+          $baseName = "roxy-llama-v0.8.0-win-x64-cuda12.4-sm86-$env:ROXY_PROFILE"
+          $archive = Join-Path $out "$baseName.zip"
+          Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $archive -CompressionLevel Optimal -Force
+          if (-not (Test-Path -LiteralPath $archive)) { throw "Failed to package archive" }
+          $zipHash = Get-FileHash -LiteralPath $archive -Algorithm SHA256
+          "$($zipHash.Hash)  $baseName.zip" | Set-Content -Path (Join-Path $out "SHA256-$baseName.txt") -Encoding ascii
+          "artifact_name=$baseName" >> $env:GITHUB_OUTPUT
+          Write-Host "Package: $archive"
+          Write-Host "Source: $sourceSha"
+          Write-Host "SHA256: $($zipHash.Hash)"
+
+      - name: Upload complete portable ZIP and SHA256
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 30
