@@ -43,7 +43,8 @@ jobs:
           repository: ggml-org/llama.cpp
           ref: v0.8.0
           path: source
-          fetch-depth: 1
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - name: Verify pinned source
